@@ -35,9 +35,9 @@ def eval_heightmap_collisions_array(height_map_array: wp.array(dtype=Heightmap),
                                     sim_idx: int,
                                     track_velocities: wp.array3d(dtype=wp.float32),
                                     contact_points: wp.array2d(dtype=wp.vec3),
-                                    constraint_forces: wp.array(dtype=wp.vec3),
-                                    friction_forces: wp.array(dtype=wp.vec3),
-                                    collisions: wp.array(dtype=wp.vec3),
+                                    constraint_forces: wp.array2d(dtype=wp.vec3),
+                                    friction_forces: wp.array2d(dtype=wp.vec3),
+                                    collisions: wp.array2d(dtype=wp.vec3),
                                     body_f: wp.array2d(dtype=wp.spatial_vectorf)):
     robot_idx, contact_idx = wp.tid()
 
@@ -126,9 +126,9 @@ def eval_heightmap_collisions_array(height_map_array: wp.array(dtype=Heightmap),
         return
 
     # Store the contact info only for the first robot TODO: vis all robots?
-    constraint_forces[contact_idx] = constraint_force
-    friction_forces[contact_idx] = friction_force
-    collisions[contact_idx] = wp.vec3(wheel_to_world_pos[0], wheel_to_world_pos[1], hm_height + hm_origin[2])
+    constraint_forces[sim_idx, contact_idx] = constraint_force
+    friction_forces[sim_idx, contact_idx] = friction_force
+    collisions[sim_idx, contact_idx] = wp.vec3(wheel_to_world_pos[0], wheel_to_world_pos[1], hm_height + hm_origin[2])
 
 
 @wp.kernel
@@ -259,7 +259,7 @@ class TrackSimulator:
         self.heightmap_vis_indices = []
         if use_renderer:
             # instantiate a renderer to render the robot
-            opengl_render_settings = dict(scaling=1)
+            opengl_render_settings = dict(scaling=1, near_plane=0.01)
             self.renderer = wp.sim.render.SimRendererOpenGL(
                 self.model,
                 'WarpSim',
@@ -280,9 +280,9 @@ class TrackSimulator:
             self.rendering_state.body_q = wp.zeros((self.n_robots + 4), dtype=wp.transformf, device=self.device, requires_grad=False)
 
         # fields for debugging of forces and collisions
-        constraint_forces = wp.zeros((self.contacts_per_track*8), dtype=wp.vec3, device=self.device, requires_grad=False)
-        friction_forces = wp.zeros((self.contacts_per_track*8), dtype=wp.vec3, device=self.device, requires_grad=False)
-        contact_positions = wp.zeros((self.contacts_per_track*8), dtype=wp.vec3, device=self.device, requires_grad=False)
+        constraint_forces = wp.zeros((T, self.contacts_per_track*8), dtype=wp.vec3, device=self.device, requires_grad=False)
+        friction_forces = wp.zeros((T, self.contacts_per_track*8), dtype=wp.vec3, device=self.device, requires_grad=False)
+        contact_positions = wp.zeros((T, self.contacts_per_track*8), dtype=wp.vec3, device=self.device, requires_grad=False)
         self.contact_info = [constraint_forces, friction_forces, contact_positions]
 
     def set_control(self, control_np, flipper_angles_np):
@@ -310,57 +310,61 @@ class TrackSimulator:
         if use_graph:
             if self.device == "cpu":
                 raise ValueError("Graph capture is only supported on CUDA devices.")
-            if self.cuda_graph is not None:  # if captured already, run it
-                wp.capture_launch(self.cuda_graph)  # use the existing graph
-                return self.body_q
-            wp.capture_begin()
-
-        try:
+            if self.cuda_graph is None:  # construct the cuda graph
+                wp.capture_begin()
+                try:
+                    self.body_f.zero_()  # zero out forces
+                    for field in self.contact_info:  # zero out contact info for visualization
+                        field.zero_()
+                    for t in range(self.T):
+                        self.simulate_flippers_heightmap(t)
+                finally:
+                    self.cuda_graph = wp.capture_end()
+            wp.capture_launch(self.cuda_graph)  # use the existing graph
+        else:
             self.body_f.zero_()  # zero out forces
             for t in range(self.T):
                 self.simulate_flippers_heightmap(t)
 
-                if render and self.renderer is not None:
-                    render_time += self.dt
-                    self.renderer.begin_frame(render_time)
-                    self.set_visualization_state(t)  # set flipper states for rendering
-                    self.renderer.render(self.rendering_state)
+        if render and self.renderer is not None:
+            constraint_forces, friction_forces, contact_positions = self.contact_info
+            constraint_forces = constraint_forces.numpy()
+            friction_forces = friction_forces.numpy()
+            contact_positions = contact_positions.numpy()
 
-                    if t == 0:
-                        for robot_idx in range(self.n_robots):
-                            current_heigthmap = self.heightmap_list[robot_idx]
-                            hm_np = current_heigthmap.heights.numpy()
-                            res = current_heigthmap.resolution
-                            render_pts = np.array(
-                                [np.array(current_heigthmap.origin) + (i * res, j * res, hm_np[i][j])
-                                 for i in range(current_heigthmap.width) for j in range(current_heigthmap.length)])
-                            self.renderer.render_mesh('heightmap%d' % robot_idx, render_pts, self.heightmap_vis_indices[robot_idx], smooth_shading=True,
-                                                      colors=[0.0, 0.5, 0.0])
-                            self.renderer.render_points('heightmap_points%d' % robot_idx, render_pts,
-                                                        colors=[[0.2, 0.6, 0.2] for _ in range(len(render_pts))], radius=0.02)
+            for t in range(self.T):
+                render_time += self.dt
+                self.renderer.begin_frame(render_time)
+                self.set_visualization_state(t)  # set flipper states for rendering
+                self.renderer.render(self.rendering_state)
 
-                    # visualize track contacts
-                    constraint_forces, friction_forces, contact_positions = self.contact_info
+                if t == 0:
+                    for robot_idx in range(self.n_robots):
+                        current_heigthmap = self.heightmap_list[robot_idx]
+                        hm_np = current_heigthmap.heights.numpy()
+                        res = current_heigthmap.resolution
+                        render_pts = np.array(
+                            [np.array(current_heigthmap.origin) + (i * res, j * res, hm_np[i][j])
+                             for i in range(current_heigthmap.width) for j in range(current_heigthmap.length)])
+                        self.renderer.render_mesh('heightmap%d' % robot_idx, render_pts,
+                                                  self.heightmap_vis_indices[robot_idx], smooth_shading=True,
+                                                  colors=[0.0, 0.5, 0.0])
+                        self.renderer.render_points('heightmap_points%d' % robot_idx, render_pts,
+                                                    colors=[[0.2, 0.6, 0.2] for _ in range(len(render_pts))], radius=0.02)
 
-                    contact_points_np = contact_positions.numpy()
-                    self.renderer.render_points('collision_points', contact_points_np,
-                                           colors=[[1.0, 1.0, 1.0] for _ in range(len(contact_points_np))], radius=0.02)
+                # visualize track contacts
+                contact_points_t = contact_positions[t]
+                self.renderer.render_points('collision_points', contact_points_t,
+                                            colors=[[1.0, 1.0, 1.0] for _ in range(len(contact_points_t))], radius=0.02)
 
-                    pts, ids = generate_force_vis(contact_points_np, constraint_forces.numpy())
-                    self.renderer.render_line_list('constraint_forces', pts, ids, color=(1.0, 0.0, 0.0), radius=0.005)
+                pts, ids = generate_force_vis(contact_points_t, constraint_forces[t])
+                self.renderer.render_line_list('constraint_forces', pts, ids, color=(1.0, 0.0, 0.0), radius=0.005)
 
-                    pts, ids = generate_force_vis(contact_points_np, friction_forces.numpy(), scale=0.01)
-                    self.renderer.render_line_list('friction_forces', pts, ids, color=(0.0, 0.0, 1.0), radius=0.005)
+                pts, ids = generate_force_vis(contact_points_t, friction_forces[t], scale=0.01)
+                self.renderer.render_line_list('friction_forces', pts, ids, color=(0.0, 0.0, 1.0), radius=0.005)
 
-                    for field in self.contact_info:
-                        field.zero_()
-
-                    self.renderer.end_frame()
-                    self.renderer.paused = False
-
-        finally:
-            if use_graph and self.cuda_graph is None:
-                self.cuda_graph = wp.capture_end()
+                self.renderer.end_frame()
+                self.renderer.paused = False
 
         return self.body_q
 
@@ -394,7 +398,7 @@ class TrackSimulator:
                     self.model.body_inv_mass,
                     self.model.body_inv_inertia,
                     self.model.gravity,
-                    0.01,
+                    0.05,
                     self.dt,
                 ],
                 device=self.device,
@@ -445,7 +449,6 @@ class TrackSimulator:
         flipper_angles = self.flipper_angles.numpy()[0][sim_idx]
         body_q_np = self.body_q.numpy()[sim_idx]  # take the current simulation state position
         robot_transform = body_q_np[0]  # transform of the first robot
-        print(self.body_q.numpy())
 
         # rendering state
         rendering_body_q_np = self.rendering_state.body_q.numpy()
@@ -454,7 +457,7 @@ class TrackSimulator:
             angle = flipper_angles[i]
             pos = np.array(self.flipper_centers.numpy()[i])
             id = self.flipper_ids[i]
-            if i >=2:
+            if i >= 2:
                 angle = angle + np.pi
             quat = R.from_rotvec([0, angle, 0]).as_quat()
             rel_transform = np.concatenate([pos, quat])
@@ -486,14 +489,17 @@ def build_tracked_robots(n_robots, contacts_per_track, device="cpu"):
         main_body = robot_builder.add_body(wp.transform([robot_idx*0.01, robot_idx*0.01, 0.0], [0, 0, 0, 1]), m=35.0, armature=0.01)
         robot_builder.add_shape_box(pos=(0.0, 0.0, 0.0), hx=body_size[0] / 2, hy=body_size[1] / 2, hz=body_size[2] / 2,
                                     body=main_body, ke=ke, kd=kd, kf=kf, mu=mu)
-        robot_builder.add_shape_sphere(body=main_body, pos=[body_size[0] / 2 + 0.02, 0, 0], radius=0.02)
+        robot_builder.add_shape_sphere(body=main_body, pos=[body_size[0] / 2 + 0.02, 0, 0], radius=0.02)  # mark the front of the robot
 
+        # add contact points for each robot
         contact_idx = 0
         for i in range(contacts_per_track):
             for side in [-1, 1]:  # left and right rows forming the tracks
-                for track in [1, -1]: # left and right tracks
-                    pos = [center[0] - track_dims[0]/2 + track_dims[0]/(contacts_per_track-1)*i, track*track_dims[1]/2 + side*track_width/2, center[1]]
-                    robot_builder.add_shape_sphere(body=main_body, pos=pos, radius=point_radius, density=contact_point_density, ke=ke, kf=kf, kd=kd, mu=mu)
+                for track in [1, -1]:  # left and right tracks
+                    pos = [center[0] - track_dims[0] / 2 + track_dims[0] / (contacts_per_track - 1) * i,
+                           track * track_dims[1] / 2 + side * track_width / 2, center[1]]
+                    robot_builder.add_shape_sphere(body=main_body, pos=pos, radius=point_radius,
+                                                   density=contact_point_density, ke=ke, kf=kf, kd=kd, mu=mu)
                     contact_positions_np[robot_idx, contact_idx] = pos
                     contact_idx += 1
 
@@ -519,8 +525,9 @@ def build_track_sim(n_robots, contacts_per_track, device="cpu"):
     robot_builder, contact_positions, flipper_centers, flipper_ids = build_tracked_robots(n_robots, contacts_per_track, device)
 
     builder.add_builder(robot_builder, wp.transform((0, 0.0, 1.0), wp.quat_identity()))
+    builder.num_rigid_contacts_per_env = 0
 
     print('Finalizing simulation')
-    model = builder.finalize(device, requires_grad=True)
+    model = builder.finalize(device, requires_grad=False)
     print('Simulation ready')
     return model, contact_positions, flipper_centers, flipper_ids
