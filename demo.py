@@ -22,7 +22,6 @@ init_poses[:, 6] = 1.0  # quaternion w
 # track_vels = 0.5*np.ones((num_robots, T, 2)) + 0.05*np.random.randn(num_robots, 1, 2)
 track_vels = 0.5*np.ones((num_robots, T, 2))
 track_vels[0, :, 0] = 0.6
-print(track_vels[:, :2])
 flipper_angles = np.zeros((num_robots, T, 4))
 # flipper_angles[0, :, 0] = 0.5
 
@@ -33,7 +32,8 @@ simulator.set_init_poses(init_poses)
 
 for i in range(10):
     start = time()
-    body_q = simulator.simulate(render=True, use_graph=True)
+    body_q = simulator.simulate(render=False, use_graph=True)
+    body_q_np = body_q.numpy()
     print('simulation took ', time() - start, ' s')
-    # print('body_q: ', body_q.numpy())
+    # print('body_q: ', body_q_np)
 

@@ -285,6 +285,10 @@ class TrackSimulator:
         contact_positions = wp.zeros((T, self.contacts_per_track*8), dtype=wp.vec3, device=self.device, requires_grad=False)
         self.contact_info = [constraint_forces, friction_forces, contact_positions]
 
+    def __del__(self):
+        if self.renderer is not None:
+            self.renderer.clear()
+
     def set_control(self, control_np, flipper_angles_np):
         assert control_np.shape == (self.n_robots, self.T, 2)
         assert flipper_angles_np.shape == (self.n_robots, self.T, 4)
